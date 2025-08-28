@@ -1,0 +1,149 @@
+import uvicorn
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+from sqlalchemy import create_engine, Column, Integer, String, select
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+
+# Importações da biblioteca de paginação
+from fastapi_pagination import add_pagination, LimitOffsetPage
+from fastapi_pagination.ext.asyncio import paginate
+
+# --- Configuração do Banco de Dados (Async com SQLite em memória) ---
+DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+engine = create_async_engine(DATABASE_URL, echo=True)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+# --- Modelos SQLAlchemy ---
+class AtletaModel(Base):
+    __tablename__ = 'atletas'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    nome = Column(String(50), nullable=False)
+    cpf = Column(String(11), unique=True, nullable=False, index=True)
+    centro_treinamento = Column(String(20), nullable=False)
+    categoria = Column(String(20), nullable=False)
+
+# --- Schemas Pydantic ---
+class AtletaBase(BaseModel):
+    nome: str = Field(description="Nome do atleta", example="João Doe", max_length=50)
+    cpf: str = Field(description="CPF do atleta", example="12345678901", max_length=11)
+    centro_treinamento: str = Field(description="Centro de treinamento", example="CT King", max_length=20)
+    categoria: str = Field(description="Categoria", example="Musculação", max_length=20)
+
+class AtletaIn(AtletaBase):
+    pass
+
+class AtletaOut(AtletaIn):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+# Schema customizado para o retorno do endpoint GET ALL
+class AtletaCustomOut(BaseModel):
+    nome: str
+    centro_treinamento: str
+    categoria: str
+
+    class Config:
+        orm_mode = True
+
+# --- Configuração da Aplicação FastAPI ---
+app = FastAPI(
+    title="API de Atletas",
+    description="Uma API para gerenciar atletas com funcionalidades avançadas.",
+    version="1.0.0"
+)
+
+# --- Manipulação de Exceções (Exception Handler) ---
+@app.exception_handler(IntegrityError)
+async def integrity_error_exception_handler(request: Request, exc: IntegrityError):
+    """
+    Manipulador para exceções de IntegrityError do SQLAlchemy.
+    Retorna um status 303 com uma mensagem customizada quando há violação de constraint (ex: CPF duplicado).
+    """
+    # Tenta extrair o valor do CPF do corpo da requisição original
+    # Isso é mais robusto do que tentar analisar a string da exceção
+    cpf_value = "desconhecido"
+    try:
+        body = await request.json()
+        if "cpf" in body:
+            cpf_value = body["cpf"]
+    except Exception:
+        # O corpo pode não ser JSON ou pode estar vazio, então ignoramos o erro
+        pass
+
+    return JSONResponse(
+        status_code=303, # Conforme solicitado. Nota: 409 Conflict é semanticamente mais comum para este caso.
+        content={"detail": f"Já existe um atleta cadastrado com o cpf: {cpf_value}"},
+    )
+
+# --- Dependências ---
+async def get_session() -> AsyncSession:
+    """
+    Fornece uma sessão do banco de dados para os endpoints.
+    """
+    async with async_session() as session:
+        yield session
+
+# --- Endpoints ---
+@app.post("/atletas", summary="Criar um novo atleta", response_model=AtletaOut, status_code=201)
+async def create_atleta(
+    atleta: AtletaIn, 
+    db_session: AsyncSession = Depends(get_session)
+):
+    """
+    Cria um novo atleta no banco de dados.
+    """
+    novo_atleta = AtletaModel(**atleta.dict())
+    db_session.add(novo_atleta)
+    await db_session.commit()
+    await db_session.refresh(novo_atleta)
+    return novo_atleta
+
+@app.get(
+    "/atletas", 
+    summary="Consultar todos os atletas",
+    # O response_model é o tipo da biblioteca, parametrizado com nosso schema customizado
+    response_model=LimitOffsetPage[AtletaCustomOut]
+)
+async def get_all_atletas(
+    db_session: AsyncSession = Depends(get_session),
+    nome: Optional[str] = Query(None, description="Filtrar por nome do atleta"),
+    cpf: Optional[str] = Query(None, description="Filtrar por CPF do atleta")
+):
+    """
+    Retorna uma lista paginada de atletas, com filtros opcionais.
+    A resposta inclui apenas nome, centro de treinamento e categoria.
+    """
+    query = select(AtletaModel)
+    
+    if nome:
+        query = query.filter(AtletaModel.nome == nome)
+    
+    if cpf:
+        query = query.filter(AtletaModel.cpf == cpf)
+
+    # A função paginate da biblioteca cuida da lógica de limit e offset
+    return await paginate(db_session, query)
+
+# --- Inicialização ---
+@app.on_event("startup")
+async def on_startup():
+    """
+    Cria as tabelas no banco de dados na inicialização da aplicação.
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# Adiciona o middleware de paginação na aplicação
+add_pagination(app)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
